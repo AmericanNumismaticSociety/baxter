@@ -9,7 +9,8 @@
 define("API_KEY", '');
 define("ENV", "DEV");
 define("INTERVAL", 300); //default interval is 300 second between analyses
-define("LOGFILE", "access.log");
+define("CLUSTER_MINIMUM", 35);
+define("LOGFILE", "access*.log");
 
 $ignore_ips = array('18.191.94.77');
 $ignore_bots = array('googlebot','bingbot','yandex','duckduckgo', 'slurp');
@@ -55,54 +56,64 @@ function initiate_process ($ignore_ips, $ignore_bots) {
         $processed_ips[] = trim($line);
     }
     
-    //create new array for Apache log file IP addresses
-    $ips = array();
+    //create new array for Apache log file(s) IP addresses
+    $ips = parse_log_files($ignore_ips, $ignore_bots);
     
-    $handle = @fopen(LOGFILE, "r");
-    if ($handle) {
-        while (($line = fgets($handle, 4096)) !== false) {
-            preg_match('/(^\d+\.\d+\.\d+\.\d+)\s/', $line, $matches);
-            $allowed_bot = false;
-            
-            //suppress any IP address that matches an allowable search robot user agent
-            foreach ($ignore_bots as $bot) {
-                if (strpos(strtolower($line), $bot) !== FALSE) {
-                    $allowed_bot = true;
-                    break;
-                }
-            }
-            
-            if (isset($matches[1]) && $allowed_bot == false) {
-                $ip = trim($matches[1]);
-                
-                //process any IP address which is not explicitly ignored
-                if (!in_array($ip, $ignore_ips)) {
-                    if (!array_key_exists($ip, $ips)) {
-                        $ips[$ip] = 1;
-                    } else {
-                        $ips[$ip] = $ips[$ip] + 1;
-                    }
-                }
-            }
-        }
-        
-        //sort by count and issue report. Superusers constitute top 0.2 percentile
-        //arsort($ips);
-        //process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips);
-        
-        //sort by keys and prepare for further processing
-        ksort($ips);
-        process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
-        
-        if (!feof($handle)) {
-            echo "Error: unexpected fgets() fail\n";
-        }
-        fclose($handle);
-    }
+    //sort by count and issue report. Superusers constitute top 0.2 percentile
+    //arsort($ips);
+    //process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips);
+    
+    //sort by keys and prepare for further processing
+    ksort($ips);
+    process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
     
     fclose($allowed_ips);
     fclose($flagged_ips);
     fclose($banned_ips);
+}
+
+/***** READ LOG FILES INTO IPS ARRAY *****/
+function parse_log_files ($ignore_ips, $ignore_bots) {
+    $ips = array();    
+    $files = glob(LOGFILE);    
+    
+    //allowing for wildcards, parse each Apache logfile to return an array of IP addresses and number of occurrences
+    foreach ($files as $file) {
+        $handle = fopen($file, "r");        
+        if ($handle) {
+            while (($line = fgets($handle, 4096)) !== false) {
+                preg_match('/(^\d+\.\d+\.\d+\.\d+)\s/', $line, $matches);
+                $allowed_bot = false;
+                
+                //suppress any IP address that matches an allowable search robot user agent
+                foreach ($ignore_bots as $bot) {
+                    if (strpos(strtolower($line), $bot) !== FALSE) {
+                        $allowed_bot = true;
+                        break;
+                    }
+                }
+                
+                if (isset($matches[1]) && $allowed_bot == false) {
+                    $ip = trim($matches[1]);
+                    
+                    //process any IP address which is not explicitly ignored
+                    if (!in_array($ip, $ignore_ips)) {
+                        if (!array_key_exists($ip, $ips)) {
+                            $ips[$ip] = 1;
+                        } else {
+                            $ips[$ip] = $ips[$ip] + 1;
+                        }
+                    }
+                }
+            }
+            
+            fclose($handle);
+        } else {
+            echo "Unable to open {$file}\n";
+        }
+    }
+    
+    return $ips;
 }
 
 /***** PROCESS SUSPICIOUS IP RANGE CLUSTERS *****/
@@ -130,87 +141,93 @@ function process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $proce
     
     foreach ($sorted as $prefix=>$arr) {        
         //threshold of 15 IPs per prefix:
-        if (count($arr) >= 15) {
+        if (count($arr) >= CLUSTER_MINIMUM) {
             $cluster[$prefix] = $arr;
         }
     }
     
-    //var_dump($cluster);
+    echo "Processing " . count($cluster) . " clusters with a minimum of " . CLUSTER_MINIMUM . " IP addresses\n";
     
-    $test = 0;
-    
-    foreach ($cluster as $prefix=>$arr) {  
-        if ($test < 5) {
-            $notation = $prefix . '.0/24';
-            
-            //if the prefix has already been checked, skip it
-            if (!in_array($notation, $processed_ips)) {
-                $index = 0;
-                $badbots = 0;
-                $flaggedbots = 0;
-                //var_dump($arr);
-                
-                //submit API calls for the first 9 IP addresses in the array of 15+
-                while ($index < 9) {
-                    $ip = $arr[$index];
-                    //get JSON from Abuse IPDB API
-                    $json = lookup_ip($ip);
-                    $score = $json->data->abuseConfidenceScore;
-                    
-                    echo "{$ip}: {$json->data->totalReports}\n";
-                    
-                    if ($score > 0) {
-                        //if there is any abuseConfidenceScore at all, count it as a bad bot
-                        echo "Bad bot: {$ip} ({$score})\n";
-                        $badbots++;
-                    } elseif ($json->data->totalReports > 0) {
-                        //evaluate reports
-                        $lastReported = strtotime($json->data->lastReportedAt);
-                        
-                        if (($currentTime - $lastReported) < 2592000) {
-                            //if the IP address has been reported within 30 days (2592000 seconds)
-                            $badbots++;
-                            $flaggedbots++;
-                            echo "IP address {$ip} reported within 30 days.\n";
-                        } else {
-                            echo "Flagging {$ip}\n";
-                            $flaggedbots++;
-                        }
-                    } 
-                    
-                    //if $badbots has reached 3, or at least 33% of the prefix cluster, block the prefix
-                    if ($badbots == 3) {
-                        echo "Blocking {$notation}\n";
-                        fwrite($banned_ips, $notation ."\n");
-                        $test++;
-                        //break the while loop at 3 to prevent further unnecessary API calls
-                        break;
-                    }
-                    
-                    $index++;
-                }
-                
-                //if $badbots has not attained a 33% threshold
-                if ($badbots < 3) {
-                    if ($flaggedbots >= 5) {
-                        echo "Flagging {$notation}\n";
-                        fwrite($flagged_ips, $notation ."\n");
-                    } else {
-                        echo "Allowing {$notation}\n";
-                        fwrite($allowed_ips, $notation ."\n");
-                    }
-                }
-            } else {            
-                echo "Processed {$notation} already.\n";
-            }
+    /*if (ENV == "DEV") {
+        //insert any necessary logic to test cluster processing here        
+        $test = 50;    
         
-        $test++;
+        $cluster = array_slice($cluster, $test, 2, true);        
+        
+        foreach ($cluster as $prefix=>$arr) {
+            analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
         }
-    }
+    } elseif (ENV == "PROD") {
+        foreach ($cluster as $prefix=>$arr) {
+            analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
+        }
+    } else {
+        echo "process_clusters() error: ENV constant not set properly. Values must be DEV or PROD.\n";
+    }*/
+}
+
+function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime) {
+    $notation = $prefix . '.0/24';
+    
+    //if the prefix has already been checked, skip it
+    if (!in_array($notation, $processed_ips)) {
+        $index = 0;
+        $badbots = 0;
+        $flaggedbots = 0;
+        //var_dump($arr);
         
-    
-    
-    //var_dump($cluster);
+        //submit API calls for the first 9 IP addresses in the array of 15+
+        while ($index < 9) {
+            $ip = $arr[$index];
+            //get JSON from Abuse IPDB API
+            $json = lookup_ip($ip);
+            $score = $json->data->abuseConfidenceScore;
+            
+            echo "{$ip}: {$json->data->totalReports}\n";
+            
+            if ($score > 0) {
+                //if there is any abuseConfidenceScore at all, count it as a bad bot
+                echo "Bad bot: {$ip} ({$score})\n";
+                $badbots++;
+            } elseif ($json->data->totalReports > 0) {
+                //evaluate reports
+                $lastReported = strtotime($json->data->lastReportedAt);
+                
+                if (($currentTime - $lastReported) < 2592000) {
+                    //if the IP address has been reported within 30 days (2592000 seconds)
+                    $badbots++;
+                    $flaggedbots++;
+                    echo "IP address {$ip} reported within 30 days.\n";
+                } else {
+                    echo "Flagging {$ip}\n";
+                    $flaggedbots++;
+                }
+            }
+            
+            //if $badbots has reached 3, or at least 33% of the prefix cluster, block the prefix
+            if ($badbots == 3) {
+                echo "Blocking {$notation}\n";
+                fwrite($banned_ips, $notation ."\n");                
+                //break the while loop at 3 to prevent further unnecessary API calls
+                break;
+            }
+            
+            $index++;
+        }
+        
+        //if $badbots has not attained a 33% threshold
+        if ($badbots < 3) {
+            if ($flaggedbots >= 3) {
+                echo "Flagging {$notation}\n";
+                fwrite($flagged_ips, $notation ."\n");
+            } else {
+                echo "Allowing {$notation}\n";
+                fwrite($allowed_ips, $notation ."\n");
+            }
+        }
+    } else {
+        echo "Processed {$notation} already.\n";
+    }
 }
 
 /***** PROCESS SUPERUSER IP ADDRESSES *****/
