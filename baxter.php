@@ -6,10 +6,11 @@
  * Requirements: Linux sendmail (for php mail()), php-curl
  */
 
-define("API_KEY", '');
+define("API_KEY", "");
 define("ENV", "DEV");
 define("INTERVAL", 300); //default interval is 300 second between analyses
 define("CLUSTER_MINIMUM", 35);
+define("WATCHLIST_BAN", 4);
 define("LOGFILE", "access*.log");
 
 $ignore_ips = array('18.191.94.77');
@@ -36,12 +37,14 @@ function initiate_process ($ignore_ips, $ignore_bots) {
         unlink('allowed_ips');
         unlink('flagged_ips');
         unlink('banned_ips');
+        //note: watchlist should be removed weekly by cron so that watchlisted IP ranges are examined for repeated requests across days in a week
     }
     
     //create allowed and banned ip file lists to prevent repetitive API calls
     $allowed_ips = fopen("allowed_ips", "a+") or die("Unable to create or open allowed_ips");
     $flagged_ips = fopen("flagged_ips", "a+") or die("Unable to create or open flagged_ips");
     $banned_ips = fopen("banned_ips", "a+") or die("Unable to create or open banned_ips");
+    $watchlist = fopen("watchlist", "a+") or die("Unable to create or open watchlist");
     
     //an array of IP addresses and ranges from the Baxter log files, which were already processed
     $processed_ips = array();
@@ -60,16 +63,17 @@ function initiate_process ($ignore_ips, $ignore_bots) {
     $ips = parse_log_files($ignore_ips, $ignore_bots);
     
     //sort by count and issue report. Superusers constitute top 0.2 percentile
-    //arsort($ips);
-    //process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips);
+    arsort($ips);
+    process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips);
     
     //sort by keys and prepare for further processing
     ksort($ips);
-    process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
+    process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime);
     
     fclose($allowed_ips);
     fclose($flagged_ips);
     fclose($banned_ips);
+    fclose($watchlist);
 }
 
 /***** READ LOG FILES INTO IPS ARRAY *****/
@@ -117,7 +121,7 @@ function parse_log_files ($ignore_ips, $ignore_bots) {
 }
 
 /***** PROCESS SUSPICIOUS IP RANGE CLUSTERS *****/
-function process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime) {
+function process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime) {
     
     //the cluster array creates a key for each prefix and the unique IDs part of that cluster so that they can be counted
     $sorted = array();
@@ -148,25 +152,25 @@ function process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $proce
     
     echo "Processing " . count($cluster) . " clusters with a minimum of " . CLUSTER_MINIMUM . " IP addresses\n";
     
-    /*if (ENV == "DEV") {
+    if (ENV == "DEV") {
         //insert any necessary logic to test cluster processing here        
         $test = 50;    
         
         $cluster = array_slice($cluster, $test, 2, true);        
         
         foreach ($cluster as $prefix=>$arr) {
-            analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
+            analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime);
         }
     } elseif (ENV == "PROD") {
         foreach ($cluster as $prefix=>$arr) {
-            analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime);
+            analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist,  $currentTime);
         }
     } else {
         echo "process_clusters() error: ENV constant not set properly. Values must be DEV or PROD.\n";
-    }*/
+    }
 }
 
-function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $currentTime) {
+function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime) {
     $notation = $prefix . '.0/24';
     
     //if the prefix has already been checked, skip it
@@ -183,7 +187,7 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
             $json = lookup_ip($ip);
             $score = $json->data->abuseConfidenceScore;
             
-            echo "{$ip}: {$json->data->totalReports}\n";
+            //echo "{$ip}: {$json->data->totalReports}\n";
             
             if ($score > 0) {
                 //if there is any abuseConfidenceScore at all, count it as a bad bot
@@ -207,7 +211,10 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
             //if $badbots has reached 3, or at least 33% of the prefix cluster, block the prefix
             if ($badbots == 3) {
                 echo "Blocking {$notation}\n";
-                fwrite($banned_ips, $notation ."\n");                
+                fwrite($banned_ips, $notation ."\n");
+                if (ENV == "PROD") {
+                    shell_exec("/sbin/iptables -I INPUT -s {$notation} -j DROP");
+                }
                 //break the while loop at 3 to prevent further unnecessary API calls
                 break;
             }
@@ -220,6 +227,28 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
             if ($flaggedbots >= 3) {
                 echo "Flagging {$notation}\n";
                 fwrite($flagged_ips, $notation ."\n");
+                
+                //also add to watchlist
+                fwrite($watchlist, $notation ."\n");
+                
+                //read the watchlist and determine whether the notation has reached the WATCHLIST_BAN limit
+                $watchlist_count = 0;
+                while (($line = fgets($watchlist, 4096)) !== false) {
+                    $line = trim($line);
+                    
+                    if ($line == $notation) {
+                        $watchlist_count++;
+                    }
+                }
+                
+                if ($watchlist_count >= WATCHLIST_BAN) {
+                    echo "Blocking watchlisted {$notation}\n";
+                    fwrite($banned_ips, $notation ."\n");
+                    if (ENV == "PROD") {
+                        shell_exec("/sbin/iptables -I INPUT -s {$notation} -j DROP");
+                    }
+                }                
+                
             } else {
                 echo "Allowing {$notation}\n";
                 fwrite($allowed_ips, $notation ."\n");
@@ -232,17 +261,19 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
 
 /***** PROCESS SUPERUSER IP ADDRESSES *****/
 function process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips) {
-    // $max / 500 is the top 0.05% in number of HTTP requests, which casts a wide net for a large log file
+    // $max / 2000 is the top 0.05% in number of HTTP requests, which casts a wide net for a large log file
     
     $max = count($ips);
-    $gateway = $max / 500;
+    $gateway = $max / 2000;
     
     foreach ($ips as $ip=>$count) {        
         if ($count > $gateway && $count >= 100) {
             //ignore processing IP addresses of superusers if they have already been evaluated previously
             if (!in_array($ip, $processed_ips)) {
                 evaluate_superuser($ip, $count, $allowed_ips, $flagged_ips, $banned_ips);
-            }          
+            } else {
+                echo "Processed {$ip} already.\n";
+            }
         }
     }    
 }
@@ -258,6 +289,9 @@ function evaluate_superuser ($ip, $count, $allowed_ips, $flagged_ips, $banned_ip
     if ( $score >= 25) {
         echo "Banning {$ip} (score {$score})\n";     
         fwrite($banned_ips, $ip ."\n");   
+        if (ENV == "PROD") {
+            shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+        }
     } elseif ($score < 25 && $score > 0) {
         echo "Flagging {$ip}\n";
         fwrite($flagged_ips, $ip ."\n");   
