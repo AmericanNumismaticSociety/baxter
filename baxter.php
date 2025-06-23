@@ -9,13 +9,14 @@
 define("API_KEY", "");
 define("ENV", "DEV");
 define("INTERVAL", 300); //default interval is 300 second between analyses
-define("CLUSTER_MINIMUM", 35);
+define("CLUSTER_MINIMUM", 35); //recommend starting at 35 for cluster to re-running manually to 20 or 15 to cull worst offenders before running baxter as a service
 define("WATCHLIST_BAN", 4);
 define("LOGFILE", "access*.log");
 
 $ignore_ips = array('18.191.94.77');
 $ignore_bots = array('googlebot','bingbot','yandex','duckduckgo', 'slurp');
 
+/***** COMMENT OUT THE LINE BELOW WHEN RUNNING AS A SERVICE *****/
 initiate_process($ignore_ips, $ignore_bots);
 
 
@@ -193,6 +194,15 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
                 //if there is any abuseConfidenceScore at all, count it as a bad bot
                 echo "Bad bot: {$ip} ({$score})\n";
                 $badbots++;
+                
+                //block any bot with a score over 25 outright
+                if ($score >= 25) {
+                    echo "Blocking {$ip}\n";
+                    fwrite($banned_ips, $ip ."\n");
+                    if (ENV == "PROD") {
+                        shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+                    }
+                }
             } elseif ($json->data->totalReports > 0) {
                 //evaluate reports
                 $lastReported = strtotime($json->data->lastReportedAt);
@@ -223,8 +233,14 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
         }
         
         //if $badbots has not attained a 33% threshold
-        if ($badbots < 3) {
-            if ($flaggedbots >= 3) {
+        if ($badbots < 3) {       
+            if ($flaggedbots >= 7) {
+                echo "Blocking {$notation}; too many flagged bots\n";
+                fwrite($banned_ips, $notation ."\n");
+                if (ENV == "PROD") {
+                    shell_exec("/sbin/iptables -I INPUT -s {$notation} -j DROP");
+                }
+            } elseif ($flaggedbots >= 3  && $flaggedbots < 7) {
                 echo "Flagging {$notation}\n";
                 fwrite($flagged_ips, $notation ."\n");
                 
