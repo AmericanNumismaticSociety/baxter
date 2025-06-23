@@ -15,6 +15,8 @@ while (true) {
     
     initiate_process($ignore_ips, $ignore_bots);
     
+    echo "Process completed.\";
+    
     //rerun in 300 seconds
     sleep(300);
 }
