@@ -76,8 +76,8 @@ function initiate_process ($ignore_ips, $ignore_bots) {
     process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips);
     
     //sort by keys and prepare for further processing
-    //ksort($ips);
-    //process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime);
+    ksort($ips);
+    process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime);
     
     fclose($allowed_ips);
     fclose($flagged_ips);
