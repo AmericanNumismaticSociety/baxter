@@ -10,15 +10,18 @@
 
 include('baxter.php');
 
-// Set the script to run indefinitely
-while (true) {
-    
-    initiate_process($ignore_ips, $ignore_bots);
-    
-    echo "Process completed.\";
-    
-    //rerun in 300 seconds
-    sleep(300);
+if ($valid == true) {
+    // Set the script to run indefinitely
+    while (true) {
+        
+        initiate_process($ignore_ips, $ignore_bots);
+        
+        echo "Process completed. Waiting " . INTERVAL . " seconds.\n";
+
+        sleep(INTERVAL);
+    }
+} else {
+    echo "Baxter configuration invalid. Recheck CONST values.\n";
 }
 
 ?>

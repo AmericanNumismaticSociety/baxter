@@ -6,39 +6,47 @@
  * Requirements: Linux sendmail (for php mail()), php-curl
  */
 
-define("API_KEY", "");
-define("ENV", "DEV");
+define("API_KEY", ""); //get API key from https://www.abuseipdb.com/ . The free account of 1,000 per day is good enough for testing
+define("ENV", "DEV"); //DEV and PROD are the only acceptable values
 define("INTERVAL", 300); //default interval is 300 second between analyses
 define("CLUSTER_MINIMUM", 35); //recommend starting at 35 for cluster to re-running manually to 20 or 15 to cull worst offenders before running baxter as a service
-define("WATCHLIST_BAN", 4);
-define("LOGFILE", "access*.log");
+define("WATCHLIST_BAN", 4); //if the IP address range has reached WATCHLIST_BAN (default: 4) times on the weekly watchlist, add it to the banned list
+define("LOGFILE", "/var/log/apache2/access*.log");
+define("EMAIL", "");
 
 $ignore_ips = array('18.191.94.77');
 $ignore_bots = array('googlebot','bingbot','yandex','duckduckgo', 'slurp');
 
-/***** COMMENT OUT THE LINE BELOW WHEN RUNNING AS A SERVICE *****/
-initiate_process($ignore_ips, $ignore_bots);
+$valid = validate_config();
 
+//if the config is valid, then begin the process
+if ($valid == true) {
+    initiate_process($ignore_ips, $ignore_bots);
+} else {
+    echo "Baxter configuration invalid. Recheck CONST values.\n";
+}
 
 /***** FUNCTIONS *****/
 //function to initiate the reading of log files and constructing an arrays of IP addresses and the volume of usage
-function initiate_process ($ignore_ips, $ignore_bots) {
-    
+function initiate_process ($ignore_ips, $ignore_bots) {    
     
     $currentTime = time();
     $timeAgo = $currentTime - INTERVAL;
     $currentDate = date('Y-m-d', $currentTime);
     $dateAgo = date('Y-m-d', $timeAgo);
     
-    //if 5 minutes ago was actually yesterday, then blank the log files
-    if ($currentDate != $dateAgo) {
-        email_report($dateAgo);
-        
-        echo "Removing yesterday's log files\n";
-        unlink('allowed_ips');
-        unlink('flagged_ips');
-        unlink('banned_ips');
-        //note: watchlist should be removed weekly by cron so that watchlisted IP ranges are examined for repeated requests across days in a week
+    //send daily reports only if email address is defined
+    if (defined('EMAIL')) {
+        //if 5 minutes ago was actually yesterday, then blank the log files
+        if ($currentDate != $dateAgo) {
+            email_report($dateAgo);
+            
+            echo "Removing yesterday's log files\n";
+            unlink('allowed_ips');
+            unlink('flagged_ips');
+            unlink('banned_ips');
+            //note: watchlist should be removed weekly by cron so that watchlisted IP ranges are examined for repeated requests across days in a week
+        }
     }
     
     //create allowed and banned ip file lists to prevent repetitive API calls
@@ -68,8 +76,8 @@ function initiate_process ($ignore_ips, $ignore_bots) {
     process_superusers ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips);
     
     //sort by keys and prepare for further processing
-    ksort($ips);
-    process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime);
+    //ksort($ips);
+    //process_clusters ($ips, $allowed_ips, $flagged_ips, $banned_ips, $processed_ips, $watchlist, $currentTime);
     
     fclose($allowed_ips);
     fclose($flagged_ips);
@@ -186,49 +194,51 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
             $ip = $arr[$index];
             //get JSON from Abuse IPDB API
             $json = lookup_ip($ip);
-            $score = $json->data->abuseConfidenceScore;
             
-            //echo "{$ip}: {$json->data->totalReports}\n";
-            
-            if ($score > 0) {
-                //if there is any abuseConfidenceScore at all, count it as a bad bot
-                echo "Bad bot: {$ip} ({$score})\n";
-                $badbots++;
+            if (isset($json->data->abuseConfidenceScore)) {
+                $score = $json->data->abuseConfidenceScore;
                 
-                //block any bot with a score over 25 outright
-                if ($score >= 25) {
-                    echo "Blocking {$ip}\n";
-                    fwrite($banned_ips, $ip ."\n");
-                    if (ENV == "PROD") {
-                        shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+                //echo "{$ip}: {$json->data->totalReports}\n";
+                
+                if ($score > 0) {
+                    //if there is any abuseConfidenceScore at all, count it as a bad bot
+                    echo "Bad bot: {$ip} ({$score})\n";
+                    $badbots++;
+                    
+                    //block any bot with a score over 25 outright
+                    if ($score >= 25) {
+                        echo "Blocking {$ip}\n";
+                        fwrite($banned_ips, $ip ."\n");
+                        if (ENV == "PROD") {
+                            shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+                        }
+                    }
+                } elseif ($json->data->totalReports > 0) {
+                    //evaluate reports
+                    $lastReported = strtotime($json->data->lastReportedAt);
+                    
+                    if (($currentTime - $lastReported) < 2592000) {
+                        //if the IP address has been reported within 30 days (2592000 seconds)
+                        $badbots++;
+                        $flaggedbots++;
+                        echo "IP address {$ip} reported within 30 days.\n";
+                    } else {
+                        echo "Flagging {$ip}\n";
+                        $flaggedbots++;
                     }
                 }
-            } elseif ($json->data->totalReports > 0) {
-                //evaluate reports
-                $lastReported = strtotime($json->data->lastReportedAt);
                 
-                if (($currentTime - $lastReported) < 2592000) {
-                    //if the IP address has been reported within 30 days (2592000 seconds)
-                    $badbots++;
-                    $flaggedbots++;
-                    echo "IP address {$ip} reported within 30 days.\n";
-                } else {
-                    echo "Flagging {$ip}\n";
-                    $flaggedbots++;
+                //if $badbots has reached 3, or at least 33% of the prefix cluster, block the prefix
+                if ($badbots == 3) {
+                    echo "Blocking {$notation}\n";
+                    fwrite($banned_ips, $notation ."\n");
+                    if (ENV == "PROD") {
+                        shell_exec("/sbin/iptables -I INPUT -s {$notation} -j DROP");
+                    }
+                    //break the while loop at 3 to prevent further unnecessary API calls
+                    break;
                 }
             }
-            
-            //if $badbots has reached 3, or at least 33% of the prefix cluster, block the prefix
-            if ($badbots == 3) {
-                echo "Blocking {$notation}\n";
-                fwrite($banned_ips, $notation ."\n");
-                if (ENV == "PROD") {
-                    shell_exec("/sbin/iptables -I INPUT -s {$notation} -j DROP");
-                }
-                //break the while loop at 3 to prevent further unnecessary API calls
-                break;
-            }
-            
             $index++;
         }
         
@@ -300,20 +310,22 @@ function evaluate_superuser ($ip, $count, $allowed_ips, $flagged_ips, $banned_ip
     //get JSON from Abuse IPDB API
     $json = lookup_ip($ip);
     
-    $score = $json->data->abuseConfidenceScore;    
-    
-    if ( $score >= 25) {
-        echo "Banning {$ip} (score {$score})\n";     
-        fwrite($banned_ips, $ip ."\n");   
-        if (ENV == "PROD") {
-            shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+    if (isset($json->data->abuseConfidenceScore)) {
+        $score = $json->data->abuseConfidenceScore;
+        
+        if ( $score >= 25) {
+            echo "Banning {$ip} (score {$score})\n";
+            fwrite($banned_ips, $ip ."\n");
+            if (ENV == "PROD") {
+                shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+            }
+        } elseif ($score < 25 && $score > 0) {
+            echo "Flagging {$ip}\n";
+            fwrite($flagged_ips, $ip ."\n");
+        } else {
+            //adding to daily whitelist
+            fwrite($allowed_ips, $ip ."\n");
         }
-    } elseif ($score < 25 && $score > 0) {
-        echo "Flagging {$ip}\n";
-        fwrite($flagged_ips, $ip ."\n");   
-    } else {
-        //adding to daily whitelist
-        fwrite($allowed_ips, $ip ."\n");        
     }
 }
 
@@ -371,8 +383,84 @@ function email_report($dateAgo) {
         }
         
         echo "Emailing daily report.\n";
-        //mail("ewg4xuva@gmail.com", $subject, $body);
+        mail(EMAIL, $subject, $body);
     }    
+}
+
+/***** VALIDATE CONFIG YAML FILE *****/
+function validate_config () {
+    $valid = true;
+    
+    if (defined('API_KEY')) {
+        //lookup an ip
+        $json = lookup_ip('8.8.8.8');
+      
+        if (!isset($json->data->abuseConfidenceScore)) {
+          echo "API_KEY invalid or reached limit.\n";
+          $valid = false;
+        }
+    } else {
+        echo "API_KEY undefined.\n";
+        $valid = false;
+    }    
+   
+    if (defined('ENV')) {
+        if (ENV != 'DEV' && ENV != 'PROD') {
+            echo "ENV value is not DEV or PROD.\n";
+            $valid = false;
+        }
+    } else {
+        echo "ENV undefined.\n";
+        $valid = false;
+    }
+    
+    if (defined('INTERVAL')) {
+        if (is_integer(INTERVAL)) {
+            if (INTERVAL < 180) {
+                echo "3 minute interval is likely too short to conclude.\n";
+                $valid = false;
+            }
+        } else {
+            echo "INTERVAL must be an integer.\n";
+            $valid = false;
+        }
+    } else {
+        echo "INTERVAL undefined.\n";
+        $valid = false;
+    }
+    
+    if (defined('CLUSTER_MINIMUM')) {
+        if (!is_integer(CLUSTER_MINIMUM)) {
+            echo "CLUSTER_MINIMUM is not an integer\n";
+            $valid = false;
+        }
+    } else {
+        echo "CLUSTER_MINIMUM undefined.\n";
+        $valid = false;
+    }
+    
+    if (defined('WATCHLIST_BAN')) {
+        if (!is_integer(WATCHLIST_BAN)) {
+            echo "WATCHLIST_BAN is not an integer\n";
+            $valid = false;
+        }
+    } else {
+        echo "WATCHLIST_BAN undefined.\n";
+        $valid = false;        
+    }
+    
+    if (defined('LOGFILE')) {
+        $files = glob(LOGFILE);
+        if (count($files) == 0) {
+            echo "No files match LOGFILE path.\n";
+            $valid = false;
+        }
+    } else {
+        echo "LOGFILE path undefined.\n";
+        $valid = false;
+    }
+    
+    return $valid;
 }
 
 ?>
