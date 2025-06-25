@@ -10,7 +10,7 @@ define("API_KEY", ""); //get API key from https://www.abuseipdb.com/ . The free 
 define("ENV", "DEV"); //DEV and PROD are the only acceptable values
 define("INTERVAL", 300); //default interval is 300 second between analyses
 define("CLUSTER_MINIMUM", 35); //recommend starting at 35 for cluster to re-running manually to 20 or 15 to cull worst offenders before running baxter as a service
-define("WATCHLIST_BAN", 4); //if the IP address range has reached WATCHLIST_BAN (default: 4) times on the weekly watchlist, add it to the banned list
+define("WATCHLIST_BAN", 3); //if the IP address range has reached WATCHLIST_BAN (default: 3) times on the weekly watchlist, add it to the banned list
 define("LOGFILE", "/var/log/apache2/access*.log");
 define("EMAIL", "");
 
@@ -255,13 +255,13 @@ function analyze_cluster ($prefix, $arr, $allowed_ips, $flagged_ips, $banned_ips
         
         //if $badbots has not attained a 33% threshold
         if ($badbots < 3) {       
-            if ($flaggedbots >= 7) {
+            if ($flaggedbots >= 4) {
                 echo "Blocking {$notation}; too many flagged bots\n";
                 fwrite($banned_ips, $notation ."\n");
                 if (ENV == "PROD") {
                     shell_exec("/sbin/iptables -I INPUT -s {$notation} -j DROP");
                 }
-            } elseif ($flaggedbots >= 3  && $flaggedbots < 7) {
+            } elseif ($flaggedbots >= 2  && $flaggedbots < 4) {
                 echo "Flagging {$notation}\n";
                 fwrite($flagged_ips, $notation ."\n");
                 
