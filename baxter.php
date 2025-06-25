@@ -35,10 +35,10 @@ function initiate_process ($ignore_ips, $ignore_bots) {
     $currentDate = date('Y-m-d', $currentTime);
     $dateAgo = date('Y-m-d', $timeAgo);
     
-    //send daily reports only if email address is defined
-    if (defined('EMAIL')) {
-        //if 5 minutes ago was actually yesterday, then blank the log files
-        if ($currentDate != $dateAgo) {
+    //if 5 minutes ago was actually yesterday, then either send report or drop all IPs from iptables again
+    if ($currentDate != $dateAgo) {    
+        //send daily reports only if email address is defined
+        if (defined('EMAIL') && strlen(EMAIL) > 0) {
             email_report($dateAgo);
             
             echo "Removing yesterday's log files\n";
@@ -46,8 +46,17 @@ function initiate_process ($ignore_ips, $ignore_bots) {
             unlink('flagged_ips');
             unlink('banned_ips');
             //note: watchlist should be removed weekly by cron so that watchlisted IP ranges are examined for repeated requests across days in a week
+        } else {
+            $banned_ips = fopen("banned_ips", "r") or die("Unable to create or open banned_ips");
+            while (($line = fgets($banned_ips, 4096)) !== false) {
+                $ip = trim($line);
+                if (ENV == "PROD") {
+                    shell_exec("/sbin/iptables -I INPUT -s {$ip} -j DROP");
+                }                    
+            }
+            fclose($banned_ips);                
         }
-    }
+    }    
     
     //create allowed and banned ip file lists to prevent repetitive API calls
     $allowed_ips = fopen("allowed_ips", "a+") or die("Unable to create or open allowed_ips");
@@ -364,6 +373,9 @@ function email_report($dateAgo) {
     while (($line = fgets($banned_ips, 4096)) !== false) {
         $banned[] = trim($line);
     }
+    
+    fclose($flagged_ips);
+    fclose($banned_ips);
     
     //only prepare the body and send the report if IP addressed or ranges have been flagged or banned from the server
     if (count($flagged) > 0 || count($banned) > 0) {
