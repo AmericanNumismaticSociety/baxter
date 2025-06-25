@@ -17,6 +17,8 @@ define("EMAIL", "");
 $ignore_ips = array('18.191.94.77');
 $ignore_bots = array('googlebot','bingbot','yandex','duckduckgo', 'slurp');
 
+
+/***** COMMENT OUT THE FOLLOWING WHEN RUNNING AS A SERVICE *****/
 $valid = validate_config();
 
 //if the config is valid, then begin the process

@@ -10,18 +10,19 @@
 
 include('baxter.php');
 
-if ($valid == true) {
-    // Set the script to run indefinitely
-    while (true) {
-        
+while (true) {
+    
+    $valid = validate_config();
+    
+    if ($valid == true) {
         initiate_process($ignore_ips, $ignore_bots);
         
         echo "Process completed. Waiting " . INTERVAL . " seconds.\n";
-
-        sleep(INTERVAL);
+    } else {
+        echo "Baxter configuration invalid. Recheck CONST values or API_KEY has reached limit.\n";
     }
-} else {
-    echo "Baxter configuration invalid. Recheck CONST values.\n";
+    
+    sleep(INTERVAL);
 }
 
 ?>
